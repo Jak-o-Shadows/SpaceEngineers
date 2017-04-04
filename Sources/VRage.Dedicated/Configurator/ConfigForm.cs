@@ -4,30 +4,31 @@ using Sandbox.Game.Gui;
 using Sandbox.Definitions;
 using Sandbox.Engine.Networking;
 using Sandbox;
-using Sandbox.Common.ObjectBuilders;
 using System.Reflection;
 using System.Diagnostics;
 using System.ServiceProcess;
 using System.Text;
-using VRage.Utils;
-using System.Collections.Generic;
-using VRage.Library.Utils;
 using VRage.FileSystem;
 using Sandbox.Engine.Utils;
-using VRage.Plugins;
 using Sandbox.Game;
 using System.ComponentModel.DataAnnotations;
-using Sandbox.Game;
+using System.IO;
+using VRage.Game;
+using System.Linq;
+using VRage.Voxels;
+using System.Collections.Generic;
 
 namespace VRage.Dedicated
 {
     public partial class ConfigForm<T> : Form where T : MyObjectBuilder_SessionSettings, new()
     {
         public static Action OnReset;
-        public static Sandbox.Common.ObjectBuilders.Game GameAttributes;
+        public static Game.Game GameAttributes;
         public static System.Drawing.Image LogoImage;
 
         IMyAsyncResult m_loadWorldsAsync;
+        IMyAsyncResult m_customWorldsAsync;
+
         MyObjectBuilder_SessionSettings m_selectedSessionSettings;
         bool m_canChangeStartType = false;
 
@@ -36,7 +37,16 @@ namespace VRage.Dedicated
         bool m_isService;
         string m_serviceName;
 
+        bool m_isEnvironmentHostilityChanged = false;
+        ComboBox m_cbbEnvironmentHostility = null;
+
         ServiceController m_serviceController;
+
+        List<ComboBox> m_blockTypeLimitNames = new List<ComboBox>();
+        List<NumericUpDown> m_blockTypeLimits = new List<NumericUpDown>();
+        BlockTypeList blockTypeList = new BlockTypeList();
+
+        string[] m_blockTypeNames;
 
         public ConfigForm(bool isService, string serviceName)
         {
@@ -48,9 +58,36 @@ namespace VRage.Dedicated
                 m_serviceController = new ServiceController(serviceName);
             }
 
+            var blockTypeResources = new System.ComponentModel.ComponentResourceManager(typeof(BlockTypeList));
+            m_blockTypeNames = blockTypeResources.GetString("textBox1.Text").Split(',');
+            foreach (var name in m_blockTypeNames)
+            {
+                name.Trim();
+            }
+
+            this.Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); 
             InitializeComponent();
 
             this.logoPictureBox.Image = LogoImage;
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            const int WM_KEYDOWN = 0x100;
+            var keyCode = (Keys)(msg.WParam.ToInt32() &
+                                  Convert.ToInt32(Keys.KeyCode));
+            if ((msg.Msg == WM_KEYDOWN && keyCode == Keys.A)
+                && (ModifierKeys == Keys.Control))
+            {
+                if (adminIDs.Focused)
+                    adminIDs.SelectAll();
+                if (bannedIDs.Focused)
+                    bannedIDs.SelectAll();
+                if (modIdsTextBox.Focused)
+                    modIdsTextBox.SelectAll();
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         private void exitButton_Click(object sender, EventArgs e)
@@ -60,30 +97,29 @@ namespace VRage.Dedicated
 
         private void startButton_Click(object sender, EventArgs e)
         {
+            if (m_selectedSessionSettings == null)
+            {
+                return;
+            }
+
             saveConfigButton_Click(sender, e);
 
             if (m_isService) // Service
             {
+                RefreshWorldsList();
+                if ( startGameButton.Checked )
+                    // fix for new game selected - new game will be started and not last saved game instead
+                    MyLocalCache.SaveLastSessionInfo("");
                 startService();
             }
             else // Local / Console
             {
+                // When running without host process, console is not properly attached on debug (no console output)
                 string[] cmdLine = Environment.GetCommandLineArgs();
-                Process.Start(cmdLine[0], ((cmdLine.Length > 1) ? cmdLine[1] : "" ) + " -console -ignorelastsession");
+                Process.Start(cmdLine[0].Replace(".vshost.exe", ".exe"), ((cmdLine.Length > 1) ? cmdLine[1] : "" ) + " -console -ignorelastsession");
                 Close();
             }
         }
-
-        struct ScenarioItem
-        {
-            public MyScenarioDefinition Definition;
-
-            public override string ToString()
-            {
-                return Definition.DisplayNameEnum.HasValue ? Definition.DisplayNameEnum.ToString() : Definition.DisplayNameString;
-            }
-        }
-
 
         private void ConfigForm_Load(object sender, EventArgs e)
         {
@@ -109,13 +145,19 @@ namespace VRage.Dedicated
                 updateServiceStatus();
             }
 
-            MyLoadListResult worldList = new MyLoadListResult();
+            
+            RefreshWorldsList();
 
-            m_loadWorldsAsync = new MyLoadListResult();
-            worldListTimer.Enabled = true;
             MySandboxGame.ConfigDedicated.Load();
 
             UpdateLoadedData();
+        }
+
+        public void RefreshWorldsList()
+        {
+            m_loadWorldsAsync = new MyLoadWorldInfoListResult();
+            m_customWorldsAsync = new MyLoadWorldInfoListResult(Path.Combine(MyFileSystem.ContentPath, "CustomWorlds"));
+            worldListTimer.Enabled = true;
         }
 
         void UpdateLoadedData()
@@ -136,22 +178,6 @@ namespace VRage.Dedicated
 
 
             MyDefinitionManager.Static.LoadScenarios();
-
-            var scenarioId = MySandboxGame.ConfigDedicated.Scenario;
-
-            foreach (var scenario in MyDefinitionManager.Static.GetScenarioDefinitions())
-            {
-                if (scenario.Public)
-                {
-                    ScenarioItem item = new ScenarioItem() { Definition = scenario };
-                    scenarioCB.Items.Add(item);
-                    if (scenario.Id == scenarioId)
-                        scenarioCB.SelectedItem = item;
-                }
-
-            }
-            if (scenarioCB.Items.Count > 0 && scenarioCB.SelectedIndex == -1)
-                scenarioCB.SelectedIndex = 0;
         }
 
         struct WorldItem
@@ -173,7 +199,11 @@ namespace VRage.Dedicated
 
             availableSaves.Sort((x, y) =>
             {
-                return x.Item1.CompareTo(y.Item1);
+                int result = y.Item2.LastSaveTime.CompareTo(x.Item2.LastSaveTime);
+                if (result != 0) return result;
+
+                result = x.Item1.CompareTo(y.Item1);
+                return result;
             });
 
             gamesListBox.Items.Clear();
@@ -194,7 +224,31 @@ namespace VRage.Dedicated
                 }
             }
 
-            gamesListBox.Sorted = true;
+            gamesListBox.Sorted = false;
+        }
+
+        private void FillCustomWorlds()
+        {
+            scenarioCB.Items.Clear();
+
+            var resultList = (MyLoadListResult)m_customWorldsAsync;
+            foreach (var availableSave in resultList.AvailableSaves)
+            {
+                WorldItem worldItem = new WorldItem()
+                {
+                    SessionName = availableSave.Item2.SessionName,
+                    SessionPath = availableSave.Item1,
+                    SessionDir = Path.GetFileName(availableSave.Item1)
+                };
+
+                scenarioCB.Items.Add(worldItem);
+
+                // Select the last if matches the same as the config
+                if(MySandboxGame.ConfigDedicated.PremadeCheckpointPath == worldItem.SessionPath)
+                {
+                    scenarioCB.SelectedIndex = scenarioCB.Items.Count - 1;
+                }
+            }
         }
 
         private void worldListTimer_Tick(object sender, EventArgs e)
@@ -211,7 +265,13 @@ namespace VRage.Dedicated
                 m_canChangeStartType = true;
                 startTypeRadio_CheckedChanged(null, null);
             }
+
+            if (m_customWorldsAsync.IsCompleted)
+            {
+                FillCustomWorlds();
+            }
         }
+    
 
         private void gamesListBox_SelectedIndexChanged(object sender, EventArgs e)
         {
@@ -247,8 +307,14 @@ namespace VRage.Dedicated
             if (!m_canChangeStartType)
                 return;
 
+            startGameButton.Enabled = true;
+
+            tableLayoutPanel1.Show();
+            newGameSettingsPanel.Show();
+
             if (loadGameButton.Checked)
             {
+              
                 if (gamesListBox.Items.Count > 0)
                 {
                     gamesListBox.Enabled = true;
@@ -266,7 +332,10 @@ namespace VRage.Dedicated
 
                     MySandboxGame.ConfigDedicated.Load();
                     m_selectedSessionSettings = MySandboxGame.ConfigDedicated.SessionSettings;
+
+                    FillSessionSettingsItems();
                 }
+
             }
             else
             {
@@ -281,23 +350,28 @@ namespace VRage.Dedicated
                 //enable tool shake needs to be true for new world, but false for old saved worlds.                                
                 m_selectedSessionSettings.EnableToolShake = true;
 
-                m_selectedSessionSettings.EnablePlanets = (MyPerGameSettings.Game == GameEnum.SE_GAME) && MyFakes.ENABLE_PLANETS; 
+                m_selectedSessionSettings.EnableFlora = (MyPerGameSettings.Game == GameEnum.SE_GAME) && MyFakes.ENABLE_PLANETS;
                 m_selectedSessionSettings.EnableSunRotation = MyPerGameSettings.Game == GameEnum.SE_GAME;
-                m_selectedSessionSettings.EnableStationVoxelSupport  = MyPerGameSettings.Game == GameEnum.SE_GAME;
+                m_selectedSessionSettings.CargoShipsEnabled = true;
+                m_selectedSessionSettings.EnableWolfs = false;
+                m_selectedSessionSettings.EnableSpiders = true;
 
+                FillSessionSettingsItems();
             }
 
-            FillSessionSettingsItems();
+            
         }
 
-        void FillSessionSettingsItems()
+        void FillSessionSettingsItems(bool loadFromConfig = false)
         {
             tableLayoutPanel1.RowCount = 0;
             tableLayoutPanel1.RowStyles.Clear();
             tableLayoutPanel1.Controls.Clear();
+            m_blockTypeLimitNames.Clear();
+            m_blockTypeLimits.Clear();
 
             Type sessionSettingsType = typeof(T);
-            foreach (var sessionField in sessionSettingsType.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.GetField | BindingFlags.SetField))
+            foreach (var sessionField in sessionSettingsType.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.GetField | BindingFlags.SetField).OrderBy(x => x.Name))
             {
                 if (sessionField.FieldType == typeof(MyOnlineModeEnum))
                     continue;
@@ -330,7 +404,7 @@ namespace VRage.Dedicated
                 if (gameAttr.Length > 0)
                 {
                     var gameRel = ((GameRelationAttribute)gameAttr[0]).RelatedTo;
-                    if (gameRel != Sandbox.Common.ObjectBuilders.Game.Shared && gameRel != GameAttributes)
+                    if (gameRel != Game.Game.Shared && gameRel != GameAttributes)
                         continue;
                 }
 
@@ -456,6 +530,23 @@ namespace VRage.Dedicated
                     AddNewRow(fieldPanel);
                 }
 
+                if (sessionField.Name == "BlockTypeLimits")
+                {
+                    FlowLayoutPanel fieldPanel = AddFieldLabel(sessionField, displayName);
+
+                    Button buttonNewLimit = new Button();
+                    buttonNewLimit.Tag = sessionField;
+                    buttonNewLimit.Text = "Add new";
+                    buttonNewLimit.Click += buttonNewLimit_Click;
+                    fieldPanel.Controls.Add(buttonNewLimit);
+
+                    AddNewRow(fieldPanel);
+                    foreach (var limit in m_selectedSessionSettings.BlockTypeLimits.Dictionary)
+                    {
+                        CreateNewBlockTypeLimit(limit.Key, limit.Value);
+                    }
+                }
+
                 if (sessionField.FieldType.IsGenericType && sessionField.FieldType.GetGenericArguments()[0] == typeof(bool))
                 {
                     FlowLayoutPanel fieldPanel = AddFieldLabel(sessionField, displayName);
@@ -475,25 +566,25 @@ namespace VRage.Dedicated
 
             }
             EnableCopyPaste(null);
-            EnableOxygen();
+            EnableOxygen(loadFromConfig);
         }
 
         void EnableCopyPaste(ComboBox sender)
         {
-            var enabled = false;
+            var isCreative = false;
 
             if (sender != null)
-                enabled = sender.SelectedIndex == 0;
+                isCreative = sender.SelectedIndex == 0;
             else
-                enabled = (tableLayoutPanel1.Controls.Find("GameMode", true)[0] as ComboBox).SelectedIndex == 0;
+                isCreative = (tableLayoutPanel1.Controls.Find("GameMode", true)[0] as ComboBox).SelectedIndex == 0;
 
             var checkLabel = tableLayoutPanel1.Controls.Find("EnableCopyPasteLabel", true);
             var checkBox = tableLayoutPanel1.Controls.Find("EnableCopyPaste", true)[0] as CheckBox;
 
-            checkBox.Enabled = enabled;
-            checkBox.Checked = enabled;
-            checkLabel[0].Enabled = enabled;
-            m_selectedSessionSettings.EnableCopyPaste = enabled;
+            checkBox.Enabled = isCreative;
+            checkBox.Checked = isCreative;
+            checkLabel[0].Enabled = isCreative;
+            m_selectedSessionSettings.EnableCopyPaste = isCreative;
 
             checkLabel = tableLayoutPanel1.Controls.Find("PermanentDeathLabel", true);
             var foundControls = tableLayoutPanel1.Controls.Find("PermanentDeath", true);
@@ -501,29 +592,37 @@ namespace VRage.Dedicated
             if (foundControls.Length > 0)
             {
                 checkBox = foundControls[0] as CheckBox;
-                checkBox.Enabled = !enabled;
-                checkBox.Checked = !enabled;
-                checkLabel[0].Enabled = !enabled;
-                m_selectedSessionSettings.PermanentDeath &= !enabled;
+                checkLabel[0].Enabled = !isCreative;
+                checkBox.Enabled = !isCreative;
+
+                if (isCreative)
+                {
+                    checkBox.Checked = false;
+                    m_selectedSessionSettings.PermanentDeath = false;
+                }
+            }
+            else
+            {
+                m_selectedSessionSettings.PermanentDeath = false;
             }
         }
 
-        void EnableOxygen()
+        void EnableOxygen(bool loadFromConfig = false)
         {
             var foundControls = tableLayoutPanel1.Controls.Find("VoxelGeneratorVersion", true);
             if (foundControls.Length > 0)
             {
                 var voxelGeneratorControl = foundControls[0] as NumericUpDown;
                 voxelGeneratorControl.Minimum = 0;
-                voxelGeneratorControl.Maximum = VRage.Voxels.MyVoxelConstants.VOXEL_GENERATOR_VERSION;
+                voxelGeneratorControl.Maximum = MyVoxelConstants.VOXEL_GENERATOR_VERSION;
 
                 var oxygenControl = tableLayoutPanel1.Controls.Find("EnableOxygen", true)[0] as CheckBox;
                 oxygenControl.CheckedChanged += oxygenCheckBox_CheckedChanged;
 
-                if (newGameSettingsPanel.Enabled)
+                if (newGameSettingsPanel.Enabled && !loadFromConfig)
                 {
                     oxygenControl.Checked = true;
-                    voxelGeneratorControl.Value = VRage.Voxels.MyVoxelConstants.VOXEL_GENERATOR_VERSION;
+                    voxelGeneratorControl.Value = MyVoxelConstants.VOXEL_GENERATOR_VERSION;
                 }
             }
         }
@@ -534,9 +633,9 @@ namespace VRage.Dedicated
             var oxygenControl = (CheckBox)sender;
             if (oxygenControl.Checked)
             {
-                if (voxelGeneratorControl.Value < VRage.Voxels.MyVoxelConstants.VOXEL_GENERATOR_MIN_ICE_VERSION)
+                if (voxelGeneratorControl.Value < MyVoxelConstants.VOXEL_GENERATOR_MIN_ICE_VERSION)
                 {
-                    voxelGeneratorControl.Value = VRage.Voxels.MyVoxelConstants.VOXEL_GENERATOR_MIN_ICE_VERSION;
+                    voxelGeneratorControl.Value = MyVoxelConstants.VOXEL_GENERATOR_MIN_ICE_VERSION;
                 }
             }
         }
@@ -550,23 +649,28 @@ namespace VRage.Dedicated
         void combo_SelectedIndexChanged(object sender, EventArgs e)
         {
             ComboBox cb = (ComboBox)sender;
+            if (MyPerGameSettings.Game == GameEnum.SE_GAME && cb.Name == "EnvironmentHostility")
+                m_isEnvironmentHostilityChanged = true;
+
             FieldInfo fieldInfo = (FieldInfo)cb.Tag;
             fieldInfo.SetValue(m_selectedSessionSettings, cb.SelectedItem);
 
-            if ((sender as ComboBox).Name == "GameMode")
-                EnableCopyPaste(sender as ComboBox);
+            if (cb.Name == "GameMode")
+                EnableCopyPaste(cb);
         }
 
         void nup_ValueChanged4(object sender, EventArgs e)
         {
             FieldInfo fieldInfo = (FieldInfo)((NumericUpDown)sender).Tag;
-            fieldInfo.SetValue(m_selectedSessionSettings, (uint)((NumericUpDown)sender).Value);
+            Decimal value = Math.Min(((NumericUpDown)sender).Value, (Decimal)uint.MaxValue);
+            fieldInfo.SetValue(m_selectedSessionSettings, (uint)value);
         }
 
         void nup_ValueChanged3(object sender, EventArgs e)
         {
             FieldInfo fieldInfo = (FieldInfo)((NumericUpDown)sender).Tag;
-            fieldInfo.SetValue(m_selectedSessionSettings, (int)((NumericUpDown)sender).Value);
+            Decimal value = Math.Min(((NumericUpDown)sender).Value, (Decimal)int.MaxValue);
+            fieldInfo.SetValue(m_selectedSessionSettings, (int)value);
         }
 
         void nup_ValueChanged2(object sender, EventArgs e)
@@ -578,7 +682,8 @@ namespace VRage.Dedicated
         void nup_ValueChanged(object sender, EventArgs e)
         {
             FieldInfo fieldInfo = (FieldInfo)((NumericUpDown)sender).Tag;
-            fieldInfo.SetValue(m_selectedSessionSettings, (short)((NumericUpDown)sender).Value);
+            Decimal value = Math.Min(((NumericUpDown)sender).Value,(Decimal)short.MaxValue);
+            fieldInfo.SetValue(m_selectedSessionSettings, (short)value);
         }
 
         private static FlowLayoutPanel AddFieldLabel(System.Reflection.FieldInfo sessionField, string displayName)
@@ -611,6 +716,26 @@ namespace VRage.Dedicated
             tableLayoutPanel1.RowStyles.Add(new RowStyle(SizeType.Absolute, 25));
             tableLayoutPanel1.Controls.Add(fieldPanel);
             tableLayoutPanel1.SetRow(fieldPanel, tableLayoutPanel1.RowCount - 1);
+        }
+
+        private void CreateNewBlockTypeLimit(string name = "", short value = 0)
+        {
+            FlowLayoutPanel newLimit = CreateFieldPanel();
+            ComboBox newLimitName = new ComboBox();
+            NumericUpDown newLimitValue = new NumericUpDown();
+            newLimitName.Width = 190;
+            newLimitName.Text = name;
+            newLimitValue.Minimum = 0;
+            newLimitValue.Maximum = short.MaxValue;
+            newLimitValue.Value = value;
+            m_blockTypeLimitNames.Add(newLimitName);
+            m_blockTypeLimits.Add(newLimitValue);
+            newLimit.Controls.Add(newLimitName);
+            newLimit.Controls.Add(newLimitValue);
+
+            newLimitName.Items.AddRange(m_blockTypeNames);
+
+            AddNewRow(newLimit);
         }
 
         void SaveConfiguration(string file = null)
@@ -686,8 +811,21 @@ namespace VRage.Dedicated
                 }
             }
 
+            m_selectedSessionSettings.BlockTypeLimits.Dictionary.Clear();
+            for (int i = 0; i < m_blockTypeLimitNames.Count; i++)
+            {
+                string key = m_blockTypeLimitNames[i].Text;
+                short value = (short)m_blockTypeLimits[i].Value;
+                if (key != "" && value > 0)
+                {
+                    m_selectedSessionSettings.BlockTypeLimits.Dictionary.Add(key, value);
+                }
+            }
+
             if (scenarioCB.SelectedItem != null)
-                MySandboxGame.ConfigDedicated.Scenario = ((ScenarioItem)scenarioCB.SelectedItem).Definition.Id;
+            {
+                MySandboxGame.ConfigDedicated.PremadeCheckpointPath = ((WorldItem)scenarioCB.SelectedItem).SessionPath;
+            }
 
             MySandboxGame.ConfigDedicated.AsteroidAmount = 0;
 
@@ -700,7 +838,7 @@ namespace VRage.Dedicated
         }
 
         private void saveConfigButton_Click(object sender, EventArgs e)
-        {
+        {    
             SaveConfiguration();
 
             if (!string.IsNullOrEmpty(MySandboxGame.ConfigDedicated.LoadWorld))
@@ -751,7 +889,7 @@ namespace VRage.Dedicated
 
                 UpdateLoadedData();
 
-                FillSessionSettingsItems();
+                FillSessionSettingsItems(true);
             }
         }
 
@@ -775,7 +913,7 @@ namespace VRage.Dedicated
 
             UpdateLoadedData();
 
-            FillSessionSettingsItems();
+            FillSessionSettingsItems(true);
         }
 
 
@@ -791,6 +929,20 @@ namespace VRage.Dedicated
             HasToExit = true;
             MyFileSystem.Reset();
             Close();
+        }
+
+        private void buttonNewLimit_Click(object sender, EventArgs e)
+        {
+            CreateNewBlockTypeLimit();
+        }
+
+        private void buttonTypeList_Click(object sender, EventArgs e)
+        {
+            if (blockTypeList.IsDisposed)
+            {
+                blockTypeList = new BlockTypeList();
+            }
+            blockTypeList.Show();
         }
         
         #region Service Controls
@@ -849,8 +1001,8 @@ namespace VRage.Dedicated
                     case ServiceControllerStatus.StopPending: { serviceStatusValueLabel.Text = "stop pending"; break; }
                 }
 
-                restartServiceButton.Enabled = m_serviceController.Status == ServiceControllerStatus.Running;
-                stopServiceButton.Enabled = m_serviceController.Status == ServiceControllerStatus.Running;
+                restartServiceButton.Enabled = m_serviceController.Status == ServiceControllerStatus.Running || m_serviceController.Status == ServiceControllerStatus.StartPending;
+                stopServiceButton.Enabled = m_serviceController.Status == ServiceControllerStatus.Running || m_serviceController.Status == ServiceControllerStatus.StartPending;
 
                 if (m_isService)
                     startButton.Enabled = m_serviceController.Status == ServiceControllerStatus.Stopped;
@@ -887,7 +1039,7 @@ namespace VRage.Dedicated
 
         private void stopService()
         {
-            if (m_serviceController.Status == ServiceControllerStatus.Running)
+            if (m_serviceController.Status == ServiceControllerStatus.Running || m_serviceController.Status == ServiceControllerStatus.StartPending)
             {
                 try
                 {

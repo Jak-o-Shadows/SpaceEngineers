@@ -1,10 +1,7 @@
 ﻿using Sandbox.Common;
-using Sandbox.Common.ObjectBuilders;
-using Sandbox.Game.Entities;
-using System;
-using VRage.Common;
-using VRage.Common.Utils;
-using VRageMath;
+using Sandbox.Engine.Voxels;
+using VRage.Game;
+using VRage.Utils;
 
 namespace Sandbox.Engine.Utils
 {
@@ -12,8 +9,13 @@ namespace Sandbox.Engine.Utils
     {
         static MyFakesLocal()
         {
-            // TODO: Set your fakes here, never commit this file
+            // NOTE: Set your fakes here. Never commit this!
+
+        }
+
+        public static void SetupLocalPerGameSettings()
+        {
+            // NOTE: Change per game settings in this method. It will override the game's per game settings. Never commit this!
         }
     }
 }
-

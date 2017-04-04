@@ -3,6 +3,8 @@ using System.ComponentModel;
 using System.Xml.Serialization;
 using ProtoBuf;
 using VRage.Utils;
+using VRage.Serialization;
+using VRage.Game.Common;
 
 namespace VRage.ObjectBuilders
 {
@@ -35,7 +37,15 @@ namespace VRage.ObjectBuilders
         private MyStringHash m_subtypeId;
         public bool ShouldSerializeSubtypeId() { return false; } // prevent serialization to XML
 
+        [Serialize]
+        private MyStringHash m_serializableSubtypeId
+        {
+            get { return m_subtypeId; }
+            set { m_subtypeId = value; m_subtypeName = value.String; }
+        }
+
         [ProtoMember, DefaultValue(null)]
+        [NoSerialize]
         public string SubtypeName
         {
             get { return m_subtypeName; }
@@ -55,13 +65,14 @@ namespace VRage.ObjectBuilders
 
         #endregion
 
-        #region Clone
+        public void Save(string filepath)
+        {
+            MyObjectBuilderSerializer.SerializeXML(filepath, false, this);
+        }
 
-        public MyObjectBuilder_Base Clone()
+        virtual public MyObjectBuilder_Base Clone()
         {
             return MyObjectBuilderSerializer.Clone(this);
         }
-
-        #endregion
     }
 }

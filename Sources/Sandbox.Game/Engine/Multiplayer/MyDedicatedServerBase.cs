@@ -1,19 +1,19 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading;
-using Sandbox.Common;
-using Sandbox.Common.ObjectBuilders;
 using Sandbox.Engine.Networking;
 using Sandbox.Engine.Utils;
 using Sandbox.Game;
 using Sandbox.Game.Multiplayer;
 using Sandbox.Game.World;
 using SteamSDK;
+using VRage.Game;
 using VRage.Trace;
 using VRage.Utils;
+using VRage.Network;
+using VRage.Library.Utils;
 
 namespace Sandbox.Engine.Multiplayer
 {
@@ -28,71 +28,7 @@ namespace Sandbox.Engine.Multiplayer
 
     #endregion
 
-    #region Messages
-
-    [ProtoBuf.ProtoContract]
-    [MessageId(13872, P2PMessageEnum.Reliable)]
-    public struct ChatMsg
-    {
-        [ProtoBuf.ProtoMember]
-        public string Text;
-    }
-
-    public enum JoinResult
-    {
-        OK,
-        AlreadyJoined,
-        TicketInvalid,
-        SteamServersOffline,
-        NotInGroup,
-        GroupIdInvalid,
-        ServerFull,
-        BannedByAdmins,
-
-        TicketCanceled,
-        TicketAlreadyUsed,
-        LoggedInElseWhere,
-        NoLicenseOrExpired,
-        UserNotConnected,
-        VACBanned,
-        VACCheckTimedOut
-    }
-
-    [ProtoBuf.ProtoContract]
-    [MessageId(13874, P2PMessageEnum.Reliable)]
-    public struct JoinResultMsg
-    {
-        [ProtoBuf.ProtoMember]
-        public JoinResult JoinResult;
-
-        [ProtoBuf.ProtoMember]
-        public ulong Admin;
-    }
-
-    [ProtoBuf.ProtoContract]
-    [MessageId(13875, P2PMessageEnum.Reliable)]
-    public struct ConnectedClientDataMsg
-    {
-        [ProtoBuf.ProtoMember]
-        public ulong SteamID;
-
-        [ProtoBuf.ProtoMember]
-        public string Name;
-
-        [ProtoBuf.ProtoMember]
-        public bool IsAdmin;
-
-        [ProtoBuf.ProtoMember]
-        public bool Join;
-
-        [ProtoBuf.ProtoMember]
-        public byte[] Token;
-    }
-
-    #endregion
-
-
-    public abstract class MyDedicatedServerBase : MyMultiplayerBase
+    public abstract class MyDedicatedServerBase : MyMultiplayerServerBase
     {
         #region Fields
 
@@ -231,8 +167,9 @@ namespace Sandbox.Engine.Multiplayer
 
 
         protected MyDedicatedServerBase(MySyncLayer syncLayer)
-            : base(syncLayer)
+            : base(syncLayer, null)
         {
+            syncLayer.TransportLayer.Register(MyMessageId.CLIENT_CONNNECTED, (p) => ClientConnected(p));
         }
 
         protected void Initialize(IPEndPoint serverEndpoint)
@@ -242,8 +179,6 @@ namespace Sandbox.Engine.Multiplayer
             ServerStarted = false;
 
             HostName = "Dedicated server";
-
-            SyncLayer.RegisterMessageImmediate<ConnectedClientDataMsg>(this.OnConnectedClient, MyMessagePermissions.Any);
 
             m_membersCollection = new MemberCollection(m_members);
             SetMemberLimit(MaxPlayers);
@@ -353,24 +288,11 @@ namespace Sandbox.Engine.Multiplayer
 
             MyLog.Default.WriteLineAndConsole("Peer2Peer_SessionRequest " + remoteUserId);
             SteamSDK.Peer2Peer.AcceptSession(remoteUserId);
-
-            //To be able to receive messages
-            RaiseClientJoined(remoteUserId);
         }
 
         void Peer2Peer_ConnectionFailed(ulong remoteUserId, P2PSessionErrorEnum error)
         {
-            m_members.Remove(remoteUserId);
-
-            ChatMemberStateChangeEnum reason = ChatMemberStateChangeEnum.Left;
-            switch (error)
-            {
-                case P2PSessionErrorEnum.Timeout:
-                    reason = ChatMemberStateChangeEnum.Disconnected;
-                    break;
-            }
-
-            RaiseClientLeft(remoteUserId, reason);
+            MyLog.Default.WriteLineAndConsole("Peer2Peer_ConnectionFailed " + remoteUserId + ", " + error);
         }
 
         void MyDedicatedServer_ClientLeft(ulong user, ChatMemberStateChangeEnum arg2)
@@ -408,9 +330,15 @@ namespace Sandbox.Engine.Multiplayer
         {
             MyLog.Default.WriteLineAndConsole("Server ValidateAuthTicketResponse (" + response.ToString() + "), owner: " + steamOwner.ToString());
 
-            if (response == AuthSessionResponseEnum.k_EAuthSessionResponseOK)
+            if (IsClientKickedOrBanned(steamOwner) || MySandboxGame.ConfigDedicated.Banned.Contains(steamOwner))
             {
-                if (MemberLimit > 0 && m_members.Count >= MemberLimit)
+                UserRejected(steamID, JoinResult.BannedByAdmins);
+                RaiseClientKicked(steamID);
+            }
+
+            if (response == AuthSessionResponseEnum.OK)
+            {
+                if (MemberLimit > 0 && m_members.Count - 1 >= MemberLimit) // Unfortunately, DS counds into the members, so subtract it
                 {
                     UserRejected(steamID, JoinResult.ServerFull);
                 }
@@ -437,25 +365,25 @@ namespace Sandbox.Engine.Multiplayer
                 JoinResult joinResult = JoinResult.TicketInvalid;
                 switch (response)
                 {
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseAuthTicketCanceled:
+                    case AuthSessionResponseEnum.AuthTicketCanceled:
                         joinResult = JoinResult.TicketCanceled;
                         break;
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseAuthTicketInvalidAlreadyUsed:
+                    case AuthSessionResponseEnum.AuthTicketInvalidAlreadyUsed:
                         joinResult = JoinResult.TicketAlreadyUsed;
                         break;
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseLoggedInElseWhere:
+                    case AuthSessionResponseEnum.LoggedInElseWhere:
                         joinResult = JoinResult.LoggedInElseWhere;
                         break;
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseNoLicenseOrExpired:
+                    case AuthSessionResponseEnum.NoLicenseOrExpired:
                         joinResult = JoinResult.NoLicenseOrExpired;
                         break;
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseUserNotConnectedToSteam:
+                    case AuthSessionResponseEnum.UserNotConnectedToSteam:
                         joinResult = JoinResult.UserNotConnected;
                         break;
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseVACBanned:
+                    case AuthSessionResponseEnum.VACBanned:
                         joinResult = JoinResult.VACBanned;
                         break;
-                    case AuthSessionResponseEnum.k_EAuthSessionResponseVACCheckTimedOut:
+                    case AuthSessionResponseEnum.VACCheckTimedOut:
                         joinResult = JoinResult.VACCheckTimedOut;
                         break;
                 }
@@ -514,25 +442,28 @@ namespace Sandbox.Engine.Multiplayer
             }
         }
 
-        private void UserAccepted(ulong steamID)
+        protected virtual void UserAccepted(ulong steamID)
         {
             System.Diagnostics.Debug.Assert(!m_members.Contains(steamID));
             m_members.Add(steamID);
 
-            MyConnectedClientData clientData = m_pendingMembers[steamID];
-            m_pendingMembers.Remove(steamID);
-
-            m_memberData[steamID] = clientData;
-
-            foreach (var user in m_members)
+            MyConnectedClientData clientData;
+            if (m_pendingMembers.TryGetValue(steamID, out clientData))
             {
-                if (user != ServerId)
-                {
-                    SendClientData(user, steamID, clientData.Name, true);
+                m_pendingMembers.Remove(steamID);
+                m_memberData[steamID] = clientData;
 
-                    // CH:Note: The connecting player will get the information about other connected players from the world object builder
-                    //if (steamID != user)
-                    //    SendClientData(steamID, user, m_memberData[user].Name, false);
+
+                foreach (var user in m_members)
+                {
+                    if (user != ServerId)
+                    {
+                        SendClientData(user, steamID, clientData.Name, true);
+
+                        // CH:Note: The connecting player will get the information about other connected players from the world object builder
+                        //if (steamID != user)
+                        //    SendClientData(steamID, user, m_memberData[user].Name, false);
+                    }
                 }
             }
 
@@ -542,13 +473,22 @@ namespace Sandbox.Engine.Multiplayer
 
         public override bool IsCorrectVersion()
         {
-            return m_appVersion == Sandbox.Common.MyFinalBuildConstants.APP_VERSION;
+            return m_appVersion == MyFinalBuildConstants.APP_VERSION;
         }
 
         public override MyDownloadWorldResult DownloadWorld()
         {
             System.Diagnostics.Debug.Fail("Dedicated server cannot download world, only create or load");
             return null;
+        }
+
+        public override void DisconnectClient(ulong userId)
+        {
+            MyControlDisconnectedMsg msg = new MyControlDisconnectedMsg();
+            msg.Client = ServerId;
+            SendControlMessage(userId, ref msg);
+
+            RaiseClientLeft(userId, ChatMemberStateChangeEnum.Disconnected);
         }
 
         public override void KickClient(ulong userId)
@@ -613,8 +553,11 @@ namespace Sandbox.Engine.Multiplayer
         {
             ChatMsg msg = new ChatMsg();
             msg.Text = text;
+            msg.Author = Sync.MyId;
 
-            SendControlMessageToAllAndSelf(ref msg);
+            SendChatMessage(ref msg);
+            // This will send the message to every client except message author
+            OnChatMessage(ref msg);
         }
 
         public void SendJoinResult(ulong sendTo, JoinResult joinResult, ulong adminID = 0)
@@ -623,7 +566,7 @@ namespace Sandbox.Engine.Multiplayer
             msg.JoinResult = joinResult;
             msg.Admin = adminID;
 
-            SendControlMessage(sendTo, ref msg);
+            ReplicationLayer.SendJoinResult(ref msg,sendTo);
         }
 
         public override void Dispose()
@@ -644,22 +587,29 @@ namespace Sandbox.Engine.Multiplayer
             //can stay not sent.
             Thread.Sleep(200);
 
-            CloseMemberSessions();
+            try
+            {
+                CloseMemberSessions();
 
-            SteamSDK.SteamServerAPI.Instance.GameServer.EnableHeartbeats(false);
+                SteamSDK.SteamServerAPI.Instance.GameServer.EnableHeartbeats(false);
 
-            base.Dispose();
+                base.Dispose();
 
-            MyLog.Default.WriteLineAndConsole("Logging off Steam...");
-            SteamSDK.SteamServerAPI.Instance.GameServer.LogOff();
+                MyLog.Default.WriteLineAndConsole("Logging off Steam...");
+                SteamSDK.SteamServerAPI.Instance.GameServer.LogOff();
 
-            MyLog.Default.WriteLineAndConsole("Shutting down server...");
-            SteamSDK.SteamServerAPI.Instance.GameServer.Shutdown();
-            MyLog.Default.WriteLineAndConsole("Done");
+                MyLog.Default.WriteLineAndConsole("Shutting down server...");
+                SteamSDK.SteamServerAPI.Instance.GameServer.Shutdown();
+                MyLog.Default.WriteLineAndConsole("Done");
 
-            SteamSDK.Peer2Peer.SessionRequest -= Peer2Peer_SessionRequest;
-            SteamSDK.Peer2Peer.ConnectionFailed -= Peer2Peer_ConnectionFailed;
-            ClientLeft -= MyDedicatedServer_ClientLeft;
+                SteamSDK.Peer2Peer.SessionRequest -= Peer2Peer_SessionRequest;
+                SteamSDK.Peer2Peer.ConnectionFailed -= Peer2Peer_ConnectionFailed;
+                ClientLeft -= MyDedicatedServer_ClientLeft;
+            }
+            catch(Exception ex)
+            {
+                MyLog.Default.WriteLineAndConsole("catch exception : " + ex.ToString());
+            }
         }
 
         public override MemberCollection Members
@@ -697,6 +647,7 @@ namespace Sandbox.Engine.Multiplayer
             return ServerId;
         }
 
+        [Obsolete("Use MySession.IsUserAdmin")]
         public override bool IsAdmin(ulong steamID)
         {
             if (m_memberData.ContainsKey(steamID))
@@ -724,19 +675,21 @@ namespace Sandbox.Engine.Multiplayer
             m_membersLimit = MyDedicatedServerOverrides.MaxPlayers.HasValue ? MyDedicatedServerOverrides.MaxPlayers.Value : limit;
         }
 
-        void OnConnectedClient(ref ConnectedClientDataMsg msg, MyNetworkClient sender)
+        protected void OnConnectedClient(ref ConnectedClientDataMsg msg, ulong steamId)
         {
+            RaiseClientJoined(steamId);
+
             MyLog.Default.WriteLineAndConsole("OnConnectedClient " + msg.Name + " attempt");
             System.Diagnostics.Debug.Assert(msg.Join);
 
-            if (m_members.Contains(msg.SteamID))
+            if (m_members.Contains(steamId))
             {
                 MyLog.Default.WriteLineAndConsole("Already joined");
-                SendJoinResult(msg.SteamID, JoinResult.AlreadyJoined);
+                SendJoinResult(steamId, JoinResult.AlreadyJoined);
                 return;
             }
 
-            if (MySandboxGame.ConfigDedicated.Banned.Contains(msg.SteamID))
+            if (MySandboxGame.ConfigDedicated.Banned.Contains(steamId))
             {
                 MyLog.Default.WriteLineAndConsole("User is banned by admins");
 
@@ -756,22 +709,22 @@ namespace Sandbox.Engine.Multiplayer
                 }
 
 
-                SendJoinResult(msg.SteamID, JoinResult.BannedByAdmins, adminID);
+                SendJoinResult(steamId, JoinResult.BannedByAdmins, adminID);
                 return;
             }
 
-            AuthSessionResponseEnum res = SteamSDK.SteamServerAPI.Instance.GameServer.BeginAuthSession(msg.SteamID, msg.Token);
-            if (res != AuthSessionResponseEnum.k_EAuthSessionResponseOK)
+            AuthSessionResponseEnum res = SteamSDK.SteamServerAPI.Instance.GameServer.BeginAuthSession(steamId, msg.Token);
+            if (res != AuthSessionResponseEnum.OK)
             {
                 MyLog.Default.WriteLineAndConsole("Authentication failed (" + res.ToString() + ")");
-                SendJoinResult(msg.SteamID, JoinResult.TicketInvalid);
+                SendJoinResult(steamId, JoinResult.TicketInvalid);
                 return;
             }
 
-            m_pendingMembers.Add(msg.SteamID, new MyConnectedClientData()
+            m_pendingMembers.Add(steamId, new MyConnectedClientData()
             {
                 Name = msg.Name,
-                IsAdmin = MySandboxGame.ConfigDedicated.Administrators.Contains(msg.SteamID.ToString()) || MySandboxGame.ConfigDedicated.Administrators.Contains(ConvertSteamIDFrom64(msg.SteamID)),
+                IsAdmin = MySandboxGame.ConfigDedicated.Administrators.Contains(steamId.ToString()) || MySandboxGame.ConfigDedicated.Administrators.Contains(ConvertSteamIDFrom64(steamId)),
             });
         }
 
@@ -779,7 +732,7 @@ namespace Sandbox.Engine.Multiplayer
         {
             MyConnectedClientData clientData;
             m_memberData.TryGetValue(steamUserID, out clientData);
-            return clientData.Name;
+            return clientData.Name == null ? ("ID:" + steamUserID) : clientData.Name;
         }
 
         void SendClientData(ulong steamTo, ulong connectedSteamID, string connectedClientName, bool join)
@@ -789,24 +742,26 @@ namespace Sandbox.Engine.Multiplayer
             msg.Name = connectedClientName;
             msg.IsAdmin = MySandboxGame.ConfigDedicated.Administrators.Contains(connectedSteamID.ToString()) || MySandboxGame.ConfigDedicated.Administrators.Contains(ConvertSteamIDFrom64(connectedSteamID));
             msg.Join = join;
-            SyncLayer.SendMessage(ref msg, steamTo);
+
+            ReplicationLayer.SendClientConnected(ref msg, steamTo);
         }
 
         protected override void OnClientKick(ref MyControlKickClientMsg data, ulong sender)
         {
-            if (IsAdmin(sender))
+            if (MySession.Static.IsUserAdmin(sender))
                 KickClient(data.KickedClient);
         }
 
         protected override void OnClientBan(ref MyControlBanClientMsg data, ulong sender)
         {
-            if (IsAdmin(sender))
+            if (MySession.Static.IsUserAdmin(sender))
                 BanClient(data.BannedClient, data.Banned);
         }
 
-        protected override void OnPing(ref MyControlPingMsg data, ulong sender)
+        void ClientConnected(VRage.MyPacket packet)
         {
-            SendControlMessage(sender, ref data);
+           ConnectedClientDataMsg msg =  ReplicationLayer.OnClientConnected(packet);
+           OnConnectedClient(ref msg,msg.SteamID);
         }
     }
 }

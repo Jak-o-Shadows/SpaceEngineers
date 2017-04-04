@@ -7,6 +7,11 @@ using VRage.FileSystem;
 using VRage.Import;
 using VRage.ModAPI;
 using VRage.Plugins;
+using VRageRender.Import;
+
+#if XB1 // XB1_ALLINONEASSEMBLY
+using VRage.Utils;
+#endif // XB1
 
 namespace VRage.Game.Entity.UseObject
 {
@@ -24,15 +29,23 @@ namespace VRage.Game.Entity.UseObject
     [PreloadRequired]
     public static class MyUseObjectFactory
     {
+#if XB1 // XB1_ALLINONEASSEMBLY
+        private static bool m_registered = false;
+#endif // XB1
+
         private static Dictionary<string, Type> m_useObjectTypesByDummyName = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
 
         static MyUseObjectFactory()
         {
+#if XB1 // XB1_ALLINONEASSEMBLY
+            RegisterAssemblyTypes(MyAssembly.AllInOneAssembly);
+#else // !XB1
             RegisterAssemblyTypes(Assembly.GetExecutingAssembly());
             RegisterAssemblyTypes(MyPlugins.GameAssembly);
             RegisterAssemblyTypes(MyPlugins.SandboxAssembly);
             RegisterAssemblyTypes(MyPlugins.UserAssembly);
             RegisterAssemblyTypes(Assembly.LoadFrom(Path.Combine(MyFileSystem.ExePath, "Sandbox.Game.dll")));
+#endif // !XB1
         }
 
         private static void RegisterAssemblyTypes(Assembly assembly)
@@ -41,7 +54,15 @@ namespace VRage.Game.Entity.UseObject
                 return;
 
             var iMyUseObject = typeof(IMyUseObject);
+#if XB1 // XB1_ALLINONEASSEMBLY
+            System.Diagnostics.Debug.Assert(m_registered == false);
+            if (m_registered == true)
+                return;
+            m_registered = true;
+            foreach (var type in MyAssembly.GetTypes())
+#else // !XB1
             foreach (var type in assembly.GetTypes())
+#endif // !XB1
             {
                 if (!iMyUseObject.IsAssignableFrom(type))
                     continue;
@@ -72,7 +93,7 @@ namespace VRage.Game.Entity.UseObject
                 if (args[0].ParameterType == typeof(IMyEntity) &&
                     args[1].ParameterType == typeof(string) &&
                     args[2].ParameterType == typeof(MyModelDummy) &&
-                    args[3].ParameterType == typeof(int))
+                    args[3].ParameterType == typeof(uint))
                 {
                     return; // found correct constructor so no need to assert
                 }
@@ -81,7 +102,7 @@ namespace VRage.Game.Entity.UseObject
             Debug.Fail(string.Format("No appropriate constructor defined for type {0}.", type.FullName));
         }
 
-        public static IMyUseObject CreateUseObject(string detectorName, IMyEntity owner, string dummyName, MyModelDummy dummyData, int shapeKey)
+        public static IMyUseObject CreateUseObject(string detectorName, IMyEntity owner, string dummyName, MyModelDummy dummyData, uint shapeKey)
         {
             Type type;
             if (!m_useObjectTypesByDummyName.TryGetValue(detectorName, out type) || type == null)
